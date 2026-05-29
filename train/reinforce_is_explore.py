@@ -86,6 +86,10 @@ BATCH_SIZE   = 64          # mini-batch size within each epoch
 LOG_STD_MIN  = -5.0        # continuous-policy std bounds
 LOG_STD_MAX  = 2.0
 MEAN_CLAMP   = 10.0        # keep tanh-Gaussian means numerically sane
+EPS_START    = 0.20        # exploration action-mixing schedule
+EPS_FINAL    = 0.02
+COUNT_BONUS  = 0.05        # intrinsic bonus: beta / sqrt(N(discretized obs))
+COUNT_BINS   = 20
 
 ALL_MODES = ("standard", "naive", "is", "snis", "truncated",
              "logclip", "ppo_clip")
@@ -161,6 +165,36 @@ def action_dim_from_space(space: spaces.Space) -> int:
     raise TypeError(f"Unsupported action space: {space}")
 
 
+def exploration_epsilon(
+    progress: float,
+    eps_start: float,
+    eps_final: float,
+) -> float:
+    progress = float(np.clip(progress, 0.0, 1.0))
+    return eps_start + progress * (eps_final - eps_start)
+
+
+def novelty_key(
+    obs_vec: np.ndarray,
+    space: spaces.Space,
+    bins: int,
+) -> tuple:
+    if isinstance(space, spaces.Discrete):
+        return (int(np.argmax(obs_vec)),)
+    if isinstance(space, spaces.Box):
+        low = np.asarray(space.low, dtype=np.float32).reshape(-1)
+        high = np.asarray(space.high, dtype=np.float32).reshape(-1)
+        finite = np.isfinite(low) & np.isfinite(high) & (high > low)
+        safe_low = np.where(finite, low, -10.0)
+        safe_high = np.where(finite, high, 10.0)
+        clipped = np.clip(obs_vec, safe_low, safe_high)
+        scaled = (clipped - safe_low) / (safe_high - safe_low + 1e-8)
+        return tuple(np.clip((scaled * bins).astype(np.int32), 0, bins - 1))
+    if isinstance(space, spaces.Dict):
+        return tuple(np.clip(np.round(obs_vec, 2), -10.0, 10.0))
+    return tuple(np.round(obs_vec, 2))
+
+
 # ---------------------------------------------------------------------------
 # Policy network
 # ---------------------------------------------------------------------------
@@ -228,6 +262,15 @@ class PolicyNet(nn.Module):
             self.action_high - self.action_low)
         return scaled.detach().cpu().numpy().reshape(self.action_space.shape)
 
+    def _env_to_raw_action(self, env_action, device: torch.device) -> torch.Tensor:
+        env_action = np.asarray(env_action, dtype=np.float32).reshape(-1)
+        low = self.action_low.detach().cpu().numpy()
+        high = self.action_high.detach().cpu().numpy()
+        unit = 2.0 * (env_action - low) / (high - low + 1e-8) - 1.0
+        unit = np.clip(unit, -0.999, 0.999)
+        raw = np.arctanh(unit).astype(np.float32)
+        return torch.as_tensor(raw, dtype=torch.float32, device=device)
+
     def _squashed_log_prob(
         self,
         dist: Normal,
@@ -249,6 +292,27 @@ class PolicyNet(nn.Module):
         env_action = self._raw_to_env_action(raw_action.squeeze(0))
         log_prob = self._squashed_log_prob(dist, raw_action)
         return raw_action.squeeze(0), env_action, log_prob, value
+
+    def sample_exploratory_action(
+        self,
+        x: torch.Tensor,
+        env: gym.Env,
+        epsilon: float,
+    ):
+        _, value = self(x)
+        if np.random.rand() >= epsilon:
+            return self.sample_action(x)
+
+        dist = self.get_dist(x)
+        if self.is_discrete:
+            env_action = int(env.action_space.sample())
+            action = torch.as_tensor(env_action, dtype=torch.long, device=x.device)
+            return action, env_action, dist.log_prob(action), value
+
+        env_action = env.action_space.sample()
+        raw_action = self._env_to_raw_action(env_action, x.device)
+        log_prob = self._squashed_log_prob(dist, raw_action.unsqueeze(0))
+        return raw_action, env_action, log_prob, value
 
     def deterministic_action(self, x: torch.Tensor):
         if self.is_discrete:
@@ -282,6 +346,10 @@ def collect_rollout(
     device: torch.device,
     gamma: float,
     gae_lambda: float,
+    epsilon: float = 0.0,
+    novelty_counts: dict[tuple, int] | None = None,
+    count_bonus: float = 0.0,
+    count_bins: int = COUNT_BINS,
 ) -> dict[str, torch.Tensor]:
     """
     Collect n_steps transitions.  Returns tensors including:
@@ -300,17 +368,23 @@ def collect_rollout(
         obs_t = torch.as_tensor(obs_vec, dtype=torch.float32,
                                 device=device).unsqueeze(0)
         with torch.no_grad():
-            action, env_action, log_prob, value = policy.sample_action(obs_t)
+            action, env_action, log_prob, value = policy.sample_exploratory_action(
+                obs_t, env, epsilon)
 
         next_obs, reward, term, trunc, _ = env.step(env_action)
         done = term or trunc
+        train_reward = float(reward)
+        if novelty_counts is not None and count_bonus > 0.0:
+            key = novelty_key(obs_vec, obs_space, count_bins)
+            novelty_counts[key] = novelty_counts.get(key, 0) + 1
+            train_reward += count_bonus / np.sqrt(novelty_counts[key])
 
         obs_buf.append(obs_vec)
         if policy.is_discrete:
             act_buf.append(int(action.item()))
         else:
             act_buf.append(action.detach().cpu().numpy())
-        rew_buf.append(reward)
+        rew_buf.append(train_reward)
         val_buf.append(value.item())
         lp_buf.append(log_prob.item())
         done_buf.append(done)
@@ -575,6 +649,10 @@ class ReinforceISTrainer:
         seed: int             = SEED,
         eval_freq: int        = EVAL_FREQ,
         n_eval_episodes: int  = N_EVAL_EPS,
+        eps_start: float      = EPS_START,
+        eps_final: float      = EPS_FINAL,
+        count_bonus: float    = COUNT_BONUS,
+        count_bins: int       = COUNT_BINS,
         group_dir: str | None = None,
     ):
         self.env_name        = env_name
@@ -593,12 +671,17 @@ class ReinforceISTrainer:
         self.seed            = seed
         self.eval_freq       = eval_freq
         self.n_eval_episodes = n_eval_episodes
+        self.eps_start       = eps_start
+        self.eps_final       = eps_final
+        self.count_bonus     = count_bonus
+        self.count_bins      = count_bins
         self.label           = f"REINFORCE-{mode.upper()}"
         self.history: dict[str, list] = {
             "timestep": [], "eval_mean": [], "eval_std": [],
             "pg_loss":  [], "vf_loss":   [], "entropy":  [],
             "ratio_mean": [], "ratio_max": [],
             "ess": [], "kl_approx": [], "clip_frac": [],
+            "epsilon": [],
         }
         self.device = torch.device("cpu")
 
@@ -625,15 +708,24 @@ class ReinforceISTrainer:
 
         total_steps = 0
         n_rollouts  = self.total_timesteps // self.n_steps
+        novelty_counts: dict[tuple, int] = {}
         pbar        = tqdm(total=self.total_timesteps, desc=self.label,
                            unit="step", dynamic_ncols=True)
         eval_rollout = 0
 
         for rollout_idx in range(n_rollouts):
             # ── Collect rollout with current π ──────────────────────────
+            epsilon = exploration_epsilon(
+                rollout_idx / max(1, n_rollouts - 1),
+                self.eps_start,
+                self.eps_final)
             batch = collect_rollout(
                 env, policy, env.observation_space, self.n_steps, self.device,
-                self.gamma, self.gae_lambda)
+                self.gamma, self.gae_lambda,
+                epsilon=epsilon,
+                novelty_counts=novelty_counts,
+                count_bonus=self.count_bonus,
+                count_bins=self.count_bins)
             total_steps += self.n_steps
             pbar.update(self.n_steps)
 
@@ -660,6 +752,7 @@ class ReinforceISTrainer:
             self.history["ess"].append(stats["ess"])
             self.history["kl_approx"].append(stats["kl_approx"])
             self.history["clip_frac"].append(stats.get("clip_frac", 0.0))
+            self.history["epsilon"].append(epsilon)
 
             # ── Periodic eval ───────────────────────────────────────────
             eval_rollout += 1
@@ -930,6 +1023,10 @@ def run_comparison(
     eval_freq: int       = EVAL_FREQ,
     n_eval_episodes: int = N_EVAL_EPS,
     n_gif_episodes: int  = N_GIF_EPS,
+    eps_start: float     = EPS_START,
+    eps_final: float     = EPS_FINAL,
+    count_bonus: float   = COUNT_BONUS,
+    count_bins: int      = COUNT_BINS,
     modes: tuple         = ALL_MODES,
 ) -> list[ReinforceISTrainer]:
     ts_str    = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -941,6 +1038,8 @@ def run_comparison(
     print(f"Timesteps   : {total_timesteps:,}")
     print(f"N steps/rollout : {n_steps}")
     print(f"K epochs/rollout: {k_epochs}  (standard always uses 1)")
+    print(f"Explore eps: {eps_start:.3f} -> {eps_final:.3f}")
+    print(f"Count bonus: {count_bonus:g}  bins={count_bins}")
     print(f"Modes       : {', '.join(modes)}\n")
 
     trainers = []
@@ -954,6 +1053,8 @@ def run_comparison(
             vf_coef=vf_coef, batch_size=batch_size,
             seed=seed, eval_freq=eval_freq,
             n_eval_episodes=n_eval_episodes,
+            eps_start=eps_start, eps_final=eps_final,
+            count_bonus=count_bonus, count_bins=count_bins,
             group_dir=group_dir,
         )
         t.train()
@@ -990,6 +1091,14 @@ if __name__ == "__main__":
                         help="Evaluate every N rollouts")
     parser.add_argument("--n-eval-eps",  default=N_EVAL_EPS,  type=int)
     parser.add_argument("--n-gif-eps",   default=N_GIF_EPS,   type=int)
+    parser.add_argument("--eps-start",   default=EPS_START,   type=float,
+                        help="Initial random-action mixing probability")
+    parser.add_argument("--eps-final",   default=EPS_FINAL,   type=float,
+                        help="Final random-action mixing probability")
+    parser.add_argument("--count-bonus", default=COUNT_BONUS, type=float,
+                        help="Intrinsic count bonus coefficient")
+    parser.add_argument("--count-bins",  default=COUNT_BINS,  type=int,
+                        help="Bins per observation dimension for count bonus")
     parser.add_argument("--modes",       default=",".join(ALL_MODES),
                         help="Comma-separated subset of modes to run")
     cli = parser.parse_args()
@@ -1010,5 +1119,9 @@ if __name__ == "__main__":
         eval_freq       = cli.eval_freq,
         n_eval_episodes = cli.n_eval_eps,
         n_gif_episodes  = cli.n_gif_eps,
+        eps_start       = cli.eps_start,
+        eps_final       = cli.eps_final,
+        count_bonus     = cli.count_bonus,
+        count_bins      = cli.count_bins,
         modes           = tuple(cli.modes.split(",")),
     )
