@@ -1,5 +1,5 @@
 # Training runs (models, plots, GIFs)
-train/runs/
+train/runs/**
 
 # Python
 .venv/
@@ -13,3 +13,11 @@ build/
 
 # macOS
 .DS_Store
+
+# photos
+# 2. Allow Git to look into subdirectories 
+!train/runs/**/
+
+# 3. Re-include only .png and .gif files inside train/runs
+!train/runs/**/*.png
+!train/runs/**/*.gif
